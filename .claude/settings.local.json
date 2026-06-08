@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.nordicsemi.com)",
+      "WebSearch",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\(r'C:\\\\Users\\\\xlu2\\\\Desktop\\\\ClaudeCode\\\\Nordic\\\\scraper.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+    ]
+  }
+}
