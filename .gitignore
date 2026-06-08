@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude Code local config
+.claude/settings.local.json
+
+# Debug artifacts (error screenshots, captured HTML)
+err*.png
+nordic_*.html

@@ -33,6 +33,13 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+try:
+    from playwright_stealth import stealth_sync as _stealth_sync
+    _HAS_STEALTH = True
+except ImportError:
+    _HAS_STEALTH = False
+    _stealth_sync = None
+
 BASE_URL = "https://www.nordicsemi.com"
 NEWS_BASE = f"{BASE_URL}/Nordic-news"
 USER_AGENT = (
@@ -57,6 +64,28 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("nordic-monitor")
+
+
+class _RingLogHandler(logging.Handler):
+    """Keep the last N WARNING+ records so the alert email can include them."""
+
+    def __init__(self, capacity: int = 200):
+        super().__init__(level=logging.WARNING)
+        self.capacity = capacity
+        self.records: list[str] = []
+        self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(self.format(record))
+        if len(self.records) > self.capacity:
+            del self.records[: len(self.records) - self.capacity]
+
+    def snapshot(self) -> str:
+        return "\n".join(self.records) if self.records else "(no warnings captured)"
+
+
+_ring_handler = _RingLogHandler()
+logging.getLogger().addHandler(_ring_handler)
 
 
 @dataclass
@@ -390,12 +419,14 @@ def send_alert(reason: str) -> None:
     # Best-effort alert; swallow secondary failures so we still exit non-zero.
     try:
         subject = "[Nordic Monitor] 抓取失败告警"
+        warnings_log = _ring_handler.snapshot()
         body = (
             "Nordic Semiconductor 监控任务执行失败。\n\n"
-            f"原因：\n{reason}\n\n"
+            f"原因 (traceback)：\n{reason}\n\n"
+            f"运行期间的 WARNING/ERROR 日志：\n{warnings_log}\n\n"
             "请检查 GitHub Actions 日志或网站结构是否变化。\n"
         )
-        html = f"<pre style='font-family:monospace;'>{escape(body)}</pre>"
+        html = f"<pre style='font-family:monospace;white-space:pre-wrap;'>{escape(body)}</pre>"
         send_email(subject, html, body)
     except Exception as exc:
         log.error("Failed to send alert email: %s", exc)
@@ -422,6 +453,14 @@ def main() -> int:
                     viewport={"width": 1280, "height": 800},
                 )
                 page = context.new_page()
+                if _HAS_STEALTH:
+                    try:
+                        _stealth_sync(page)
+                        log.info("Applied playwright-stealth patches")
+                    except Exception as exc:
+                        log.warning("stealth_sync failed (%s); continuing without it", exc)
+                else:
+                    log.warning("playwright-stealth not installed; bot detection may trigger")
                 fetch_html = make_browser_fetcher(page)
                 articles = collect_recent_articles(lookback_days, fetch_html)
             finally:
