@@ -22,11 +22,16 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
 from html import escape
+from typing import Callable
 from urllib.parse import urljoin
 
-import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 BASE_URL = "https://www.nordicsemi.com"
 NEWS_BASE = f"{BASE_URL}/Nordic-news"
@@ -35,8 +40,14 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 REQUEST_TIMEOUT = 30
+NAV_TIMEOUT_MS = 45000
+NETWORK_IDLE_TIMEOUT_MS = 15000
+CONTENT_WAIT_MS = 30000
+CHALLENGE_EXTRA_WAIT_MS = 8000
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
+
+FetchHtml = Callable[[str, str], str]
 
 # Match article URLs like /Nordic-news/2026/03/Nordic-accelerates-...
 ARTICLE_PATH_RE = re.compile(r"^/Nordic-news/(\d{4})/(\d{2})/([^/?#]+)/?$")
@@ -58,15 +69,50 @@ class Article:
     published: datetime
 
 
-def http_get(url: str) -> str:
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or "utf-8"
-    return resp.text
+_CHALLENGE_MARKERS = (
+    "Just a moment...",
+    "challenges.cloudflare.com",
+    "_cf_chl_opt",
+    "cf-browser-verification",
+)
+
+
+def _looks_like_challenge(html: str) -> bool:
+    return any(marker in html for marker in _CHALLENGE_MARKERS)
+
+
+def make_browser_fetcher(page) -> FetchHtml:
+    """Return fetch_html(url, content_selector) bound to a Playwright page."""
+
+    def fetch(url: str, content_selector: str = "") -> str:
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            pass
+
+        if content_selector:
+            try:
+                page.wait_for_selector(content_selector, timeout=CONTENT_WAIT_MS)
+            except PlaywrightTimeoutError:
+                log.warning("Selector %r never appeared on %s", content_selector, url)
+
+        html = page.content()
+        if _looks_like_challenge(html):
+            log.info("Cloudflare challenge on %s — waiting %dms for auto-resolve",
+                     url, CHALLENGE_EXTRA_WAIT_MS)
+            page.wait_for_timeout(CHALLENGE_EXTRA_WAIT_MS)
+            if content_selector:
+                try:
+                    page.wait_for_selector(content_selector, timeout=CONTENT_WAIT_MS)
+                except PlaywrightTimeoutError:
+                    pass
+            html = page.content()
+            if _looks_like_challenge(html):
+                raise RuntimeError(f"Cloudflare challenge unresolved for {url}")
+        return html
+
+    return fetch
 
 
 def listing_urls_for_window(today: datetime, lookback_days: int) -> list[str]:
@@ -164,26 +210,33 @@ def translate_text(translator: GoogleTranslator, text: str) -> str:
         return text
 
 
-def collect_recent_articles(lookback_days: int) -> list[Article]:
+def collect_recent_articles(lookback_days: int, fetch_html: FetchHtml) -> list[Article]:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=lookback_days)
 
     article_urls: set[str] = set()
+    listing_failures = 0
     for listing_url in listing_urls_for_window(now, lookback_days):
         log.info("Fetching listing: %s", listing_url)
         try:
-            html = http_get(listing_url)
-        except requests.RequestException as exc:
+            html = fetch_html(listing_url, 'a[href*="/Nordic-news/2"]')
+        except (PlaywrightError, PlaywrightTimeoutError, RuntimeError) as exc:
             log.warning("Listing %s failed: %s", listing_url, exc)
+            listing_failures += 1
             continue
         urls = discover_article_urls(html)
         log.info("  found %d article links", len(urls))
         article_urls.update(urls)
 
     if not article_urls:
+        if listing_failures:
+            raise RuntimeError(
+                f"All {listing_failures} listing page(s) failed to load — "
+                "see warnings above (likely network/Cloudflare/browser issue)."
+            )
         raise RuntimeError(
-            "No article links found on Nordic news listing pages — "
-            "the page structure may have changed."
+            "Listing pages loaded but no article links matched the expected "
+            "/Nordic-news/YYYY/MM/<slug> pattern — Nordic may have changed URLs."
         )
 
     # Quick filter by year/month from URL before fetching full pages.
@@ -211,8 +264,8 @@ def collect_recent_articles(lookback_days: int) -> list[Article]:
     articles: list[Article] = []
     for url in sorted(candidate_urls):
         try:
-            html = http_get(url)
-        except requests.RequestException as exc:
+            html = fetch_html(url, "h1")
+        except (PlaywrightError, PlaywrightTimeoutError, RuntimeError) as exc:
             log.warning("Article %s failed: %s", url, exc)
             continue
 
@@ -357,7 +410,22 @@ def main() -> int:
             return 2
 
     try:
-        articles = collect_recent_articles(lookback_days)
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    locale="en-US",
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = context.new_page()
+                fetch_html = make_browser_fetcher(page)
+                articles = collect_recent_articles(lookback_days, fetch_html)
+            finally:
+                browser.close()
     except Exception:
         tb = traceback.format_exc()
         log.error("Scrape failed:\n%s", tb)
